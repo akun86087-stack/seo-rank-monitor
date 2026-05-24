@@ -3,63 +3,97 @@ const axios = require('axios');
 const cron = require('node-cron');
 
 const token = process.env.BOT_TOKEN;
-const bot = new TelegramBot(token, { polling: true });
 
-// TOPIC ID TELEGRAM
+const bot = new TelegramBot(token, {
+  polling: true
+});
+
+// =======================
+// GROUP TELEGRAM
+// =======================
+
+const GROUP_ID = -1003954107367;
+
+// =======================
+// TOPIC ID
+// =======================
+
 const TOPICS = {
   SATSET138: 4,
   MAHJONG138: 3,
   DOLAR138: 2
 };
 
-// DOMAIN DATABASE
+// =======================
+// DATABASE DOMAIN
+// =======================
+
 let domains = {
   SATSET138: [],
   MAHJONG138: [],
   DOLAR138: []
 };
 
+// =======================
 // STATUS SEBELUMNYA
+// =======================
+
 let previousStatus = {};
 
-// CHAT ID GROUP
-let GROUP_ID = -1003954107367;
-
 // =======================
-// COMMAND TAMBAH DOMAIN
+// HITUNG HILANG
 // =======================
 
-bot.onText(/\/add (.+)/, (msg, match) => {
+let disappearCount = {};
+
+// =======================
+// TAMBAH DOMAIN
+// =======================
+
+bot.onText(/\/add (.+)/, async (msg, match) => {
+
   const text = match[1];
 
-  // format:
-  // /add SATSET138 https://domain.com
   const split = text.split(" ");
 
   const keyword = split[0];
   const domain = split[1];
 
   if (!domains[keyword]) {
-    bot.sendMessage(msg.chat.id, "Keyword tidak ditemukan.");
+
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Keyword tidak ditemukan.'
+    );
+
     return;
   }
 
-  domains[keyword].push(domain);
+  if (!domains[keyword].includes(domain)) {
+
+    domains[keyword].push(domain);
+
+  }
 
   bot.sendMessage(
     GROUP_ID,
-    `✅ DOMAIN DITAMBAHKAN\n\nKeyword: ${keyword}\nDomain: ${domain}`,
+    `✅ DOMAIN DITAMBAHKAN
+
+Keyword: ${keyword}
+Domain: ${domain}`,
     {
       message_thread_id: TOPICS[keyword]
     }
   );
+
 });
 
 // =======================
-// COMMAND HAPUS DOMAIN
+// HAPUS DOMAIN
 // =======================
 
-bot.onText(/\/remove (.+)/, (msg, match) => {
+bot.onText(/\/remove (.+)/, async (msg, match) => {
+
   const text = match[1];
 
   const split = text.split(" ");
@@ -69,45 +103,87 @@ bot.onText(/\/remove (.+)/, (msg, match) => {
 
   if (!domains[keyword]) return;
 
-  domains[keyword] = domains[keyword].filter(d => d !== domain);
+  domains[keyword] = domains[keyword].filter(
+    d => d !== domain
+  );
 
   bot.sendMessage(
     GROUP_ID,
-    `❌ DOMAIN DIHAPUS\n\nKeyword: ${keyword}\nDomain: ${domain}`,
+    `❌ DOMAIN DIHAPUS
+
+Keyword: ${keyword}
+Domain: ${domain}`,
     {
       message_thread_id: TOPICS[keyword]
     }
   );
+
 });
 
 // =======================
-// CEK GOOGLE RANK
+// CEK RANK GOOGLE
+// MOBILE + INDONESIA
 // =======================
 
 async function checkRank(keyword, domain) {
+
   try {
+
     const query = encodeURIComponent(keyword);
 
-    const url = `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100`;
+    const url =
+      `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100&pws=0`;
 
     const response = await axios.get(url, {
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 Chrome/122.0.0.0 Mobile Safari/537.36'
       }
     });
 
     const html = response.data;
 
-    return html.includes(domain);
+    const regex = /<a href="\/url\?q=(.*?)&/g;
+
+    let match;
+
+    let rank = 0;
+
+    while ((match = regex.exec(html)) !== null) {
+
+      const resultUrl = decodeURIComponent(match[1]);
+
+      if (resultUrl.includes(domain)) {
+
+        return {
+          found: true,
+          rank: rank + 1
+        };
+
+      }
+
+      rank++;
+
+    }
+
+    return {
+      found: false,
+      rank: null
+    };
 
   } catch (e) {
-    return false;
+
+    return {
+      found: false,
+      rank: null
+    };
+
   }
+
 }
 
 // =======================
-// MONITOR
+// MONITOR AUTO
 // =======================
 
 async function monitor() {
@@ -116,59 +192,112 @@ async function monitor() {
 
     for (const domain of domains[keyword]) {
 
-      const found = await checkRank(keyword, domain);
+      const result = await checkRank(
+        keyword,
+        domain
+      );
+
+      const found = result.found;
+
+      const rank = result.rank;
 
       const key = `${keyword}_${domain}`;
 
-      // MUNCUL
-      if (found && previousStatus[key] !== true) {
+      // =======================
+      // DOMAIN MUNCUL
+      // =======================
+
+      if (
+        found &&
+        previousStatus[key] !== true
+      ) {
 
         previousStatus[key] = true;
 
+        disappearCount[key] = 0;
+
         bot.sendMessage(
           GROUP_ID,
-          `🚀 DOMAIN MUNCUL DI GOOGLE\n\nKeyword: ${keyword}\nDomain: ${domain}`,
+          `🚀 DOMAIN MUNCUL DI GOOGLE
+
+Keyword: ${keyword}
+Domain: ${domain}
+Rank Mobile ID: ${rank}`,
           {
             message_thread_id: TOPICS[keyword]
           }
         );
+
       }
 
-      // HILANG
-      if (!found && previousStatus[key] === true) {
+      // =======================
+      // DOMAIN HILANG
+      // =======================
+
+      if (
+        !found &&
+        previousStatus[key] === true
+      ) {
 
         previousStatus[key] = false;
 
+        disappearCount[key] =
+          (disappearCount[key] || 0) + 1;
+
         bot.sendMessage(
           GROUP_ID,
-          `⚠️ DOMAIN HILANG DARI GOOGLE\n\nKeyword: ${keyword}\nDomain: ${domain}`,
+          `⚠️ DOMAIN HILANG DARI GOOGLE
+
+Keyword: ${keyword}
+Domain: ${domain}
+Jumlah Hilang: ${disappearCount[key]}/2`,
           {
             message_thread_id: TOPICS[keyword]
           }
         );
+
+        // AUTO HAPUS JIKA HILANG 2X
+
+        if (disappearCount[key] >= 2) {
+
+          domains[key] = domains[key].filter(
+            d => d !== domain
+          );
+
+          bot.sendMessage(
+            GROUP_ID,
+            `🗑 DOMAIN AUTO DIHAPUS
+
+Keyword: ${keyword}
+Domain: ${domain}`,
+            {
+              message_thread_id: TOPICS[keyword]
+            }
+          );
+
+        }
+
       }
+
     }
+
   }
+
 }
 
 // =======================
 // CEK SETIAP 30 MENIT
 // =======================
 
-cron.schedule('*/30 * * * *', () => {
-  monitor();
+cron.schedule('*/30 * * * *', async () => {
+
+  await monitor();
+
 });
 
-bot.sendMessage(
-  GROUP_ID,
-  '🤖 BOT SEO RANK MONITOR AKTIF',
-  {
-    message_thread_id: TOPICS.SATSET138
-  }
-);
-
 // =======================
-// FORCE CHECK MANUAL
+// CHECK MANUAL
+// SESUAI TOPIC
 // =======================
 
 bot.onText(/\/check/, async (msg) => {
@@ -177,24 +306,31 @@ bot.onText(/\/check/, async (msg) => {
 
   let selectedKeyword = null;
 
-  // DETEKSI TOPIC
   for (const keyword in TOPICS) {
+
     if (TOPICS[keyword] === topicId) {
+
       selectedKeyword = keyword;
+
     }
+
   }
 
   if (!selectedKeyword) {
+
     bot.sendMessage(
       msg.chat.id,
-      '❌ Command hanya bisa dipakai di topic keyword.'
+      '❌ Gunakan command di dalam topic.'
     );
+
     return;
   }
 
   bot.sendMessage(
-    msg.chat.id,
-    `🔎 Checking ranking ${selectedKeyword}...`,
+    GROUP_ID,
+    `📊 STATUS KEYWORD ${selectedKeyword}
+
+🔎 Checking ranking ${selectedKeyword}...`,
     {
       message_thread_id: topicId
     }
@@ -204,35 +340,15 @@ bot.onText(/\/check/, async (msg) => {
 
   for (const domain of domains[selectedKeyword]) {
 
-    const found = await checkRank(selectedKeyword, domain);
+    const result = await checkRank(
+      selectedKeyword,
+      domain
+    );
 
-    // CARI POSISI
-    let rank = "NOT FOUND";
+    report += `${result.found ? '✅' : '❌'} ${domain}\n`;
 
-    try {
+    report += `📌 Rank Mobile ID: ${result.rank || 'NOT FOUND'}\n\n`;
 
-      const query = encodeURIComponent(selectedKeyword);
-
-      const url = `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100`;
-
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      });
-
-      const html = response.data;
-
-      const split = html.split(domain);
-
-      if (split.length > 1) {
-        rank = split.length - 1;
-      }
-
-    } catch (e) {}
-
-    report += `${found ? '✅' : '❌'} ${domain}\n📌 Rank: ${rank}\n\n`;
   }
 
   bot.sendMessage(
@@ -244,3 +360,15 @@ bot.onText(/\/check/, async (msg) => {
   );
 
 });
+
+// =======================
+// BOT ONLINE
+// =======================
+
+bot.sendMessage(
+  GROUP_ID,
+  '🤖 BOT SEO RANK MONITOR AKTIF',
+  {
+    message_thread_id: TOPICS.SATSET138
+  }
+);
