@@ -166,3 +166,23 @@ bot.sendMessage(
     message_thread_id: TOPICS.SATSET138
   }
 );
+
+// =======================
+// FORCE CHECK MANUAL
+// =======================
+
+bot.onText(/\/check/, async (msg) => {
+
+  bot.sendMessage(
+    msg.chat.id,
+    '🔎 Checking ranking manual...'
+  );
+
+  await monitor();
+
+  bot.sendMessage(
+    msg.chat.id,
+    '✅ Check selesai.'
+  );
+
+});
