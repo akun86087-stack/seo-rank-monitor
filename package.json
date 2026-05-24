@@ -1,0 +1,33 @@
+{
+  "name": "telegram-seo-rank-monitor-bot",
+  "version": "1.0.0",
+  "description": "Telegram SEO SERP Rank Monitor Bot — Google Mobile Indonesia, auto-monitoring setiap 30 menit",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "telegram",
+    "seo",
+    "serp",
+    "rank",
+    "monitor",
+    "serpapi",
+    "google",
+    "indonesia"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.12.0"
+  }
+}
