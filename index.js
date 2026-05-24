@@ -173,16 +173,74 @@ bot.sendMessage(
 
 bot.onText(/\/check/, async (msg) => {
 
+  const topicId = msg.message_thread_id;
+
+  let selectedKeyword = null;
+
+  // DETEKSI TOPIC
+  for (const keyword in TOPICS) {
+    if (TOPICS[keyword] === topicId) {
+      selectedKeyword = keyword;
+    }
+  }
+
+  if (!selectedKeyword) {
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Command hanya bisa dipakai di topic keyword.'
+    );
+    return;
+  }
+
   bot.sendMessage(
     msg.chat.id,
-    '🔎 Checking ranking manual...'
+    `🔎 Checking ranking ${selectedKeyword}...`,
+    {
+      message_thread_id: topicId
+    }
   );
 
-  await monitor();
+  let report = `📊 STATUS KEYWORD ${selectedKeyword}\n\n`;
+
+  for (const domain of domains[selectedKeyword]) {
+
+    const found = await checkRank(selectedKeyword, domain);
+
+    // CARI POSISI
+    let rank = "NOT FOUND";
+
+    try {
+
+      const query = encodeURIComponent(selectedKeyword);
+
+      const url = `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100`;
+
+      const response = await axios.get(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+
+      const html = response.data;
+
+      const split = html.split(domain);
+
+      if (split.length > 1) {
+        rank = split.length - 1;
+      }
+
+    } catch (e) {}
+
+    report += `${found ? '✅' : '❌'} ${domain}\n📌 Rank: ${rank}\n\n`;
+  }
 
   bot.sendMessage(
-    msg.chat.id,
-    '✅ Check selesai.'
+    GROUP_ID,
+    report,
+    {
+      message_thread_id: topicId
+    }
   );
 
 });
