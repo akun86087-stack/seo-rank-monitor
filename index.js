@@ -24,10 +24,13 @@ for (const key of REQUIRED_ENV) {
 // CONSTANTS & CONFIG
 // ============================================================
 
-const PORT = process.env.PORT || 3000;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const PORT        = process.env.PORT || 3000;
+const CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
+
+// Debug mode: set DEBUG_RANK=true in .env to enable verbose SERP logging
+const DEBUG_RANK  = process.env.DEBUG_RANK === 'true';
 
 // Topic ID → Keyword mapping (edit to match your Telegram forum topics)
 const TOPIC_KEYWORD_MAP = {
@@ -36,13 +39,24 @@ const TOPIC_KEYWORD_MAP = {
   2: 'DOLAR138',
 };
 
-// Reverse map for lookup
+// Reverse map keyword → topicId
 const KEYWORD_TOPIC_MAP = Object.fromEntries(
   Object.entries(TOPIC_KEYWORD_MAP).map(([id, kw]) => [kw, parseInt(id)])
 );
 
 // Delay between SERPAPI calls (ms) to avoid rate limiting
 const SERPAPI_DELAY_MS = 2500;
+
+// Google infrastructure hostnames to skip (exact or suffix match after normalization)
+const GOOGLE_INFRA_SUFFIXES = [
+  'google.com',
+  'google.co.id',
+  'googleusercontent.com',
+  'translate.googleapis.com',
+  'gstatic.com',
+  'googleapis.com',
+  'amp.google.com',
+];
 
 // ============================================================
 // EXPRESS SERVER (Railway keepalive)
@@ -54,7 +68,7 @@ app.use(express.json());
 app.get('/', (_req, res) => {
   res.json({
     bot: 'Telegram SEO Rank Monitor',
-    version: '1.0.0',
+    version: '1.1.0',
     status: 'running',
     uptime_seconds: Math.floor(process.uptime()),
   });
@@ -65,7 +79,6 @@ app.get('/health', (_req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor(process.uptime()),
-    environment: process.env.NODE_ENV || 'production',
   });
 });
 
@@ -108,7 +121,7 @@ bot.on('error', (err) => {
 });
 
 // ============================================================
-// DATABASE INIT & HELPERS
+// DATABASE INIT
 // ============================================================
 
 async function initDB() {
@@ -116,16 +129,16 @@ async function initDB() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS domains (
-        id           SERIAL PRIMARY KEY,
-        keyword      VARCHAR(255)  NOT NULL,
-        domain       VARCHAR(255)  NOT NULL,
-        current_rank INTEGER,
+        id            SERIAL PRIMARY KEY,
+        keyword       VARCHAR(255)  NOT NULL,
+        domain        VARCHAR(255)  NOT NULL,
+        current_rank  INTEGER,
         previous_rank INTEGER,
-        status       VARCHAR(50)   NOT NULL DEFAULT 'NOT_FOUND',
-        change_type  VARCHAR(50),
-        last_checked TIMESTAMPTZ,
-        last_seen    TIMESTAMPTZ,
-        created_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+        status        VARCHAR(50)   NOT NULL DEFAULT 'NOT_FOUND',
+        change_type   VARCHAR(50),
+        last_checked  TIMESTAMPTZ,
+        last_seen     TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
         UNIQUE (keyword, domain)
       );
     `);
@@ -141,22 +154,231 @@ async function initDB() {
 }
 
 // ============================================================
-// UTILITY FUNCTIONS
+// ███████╗ ██████╗  ██████╗     ███████╗██╗██╗  ██╗
+// ██╔════╝██╔════╝ ██╔═══██╗    ██╔════╝██║╚██╗██╔╝
+// ███████╗█████╗   ██║   ██║    █████╗  ██║ ╚███╔╝
+// ╚════██║██╔══╝   ██║   ██║    ██╔══╝  ██║ ██╔██╗
+// ███████║███████╗ ╚██████╔╝    ██║     ██║██╔╝ ██╗
+// ╚══════╝╚══════╝  ╚═════╝     ╚═╝     ╚═╝╚═╝  ╚═╝
+//
+// DOMAIN NORMALIZATION & RANK DETECTION ENGINE
 // ============================================================
 
 /**
- * Clean user-submitted domain:
- * - Strip https:// or http://
- * - Strip trailing slashes & paths
- * - Lowercase
+ * normalizeDomain(input)
+ *
+ * Converts any URL or domain string into a clean, comparable hostname.
+ *
+ * Rules applied (in order):
+ *  1. Trim whitespace
+ *  2. Lowercase
+ *  3. Prepend https:// if no protocol present (required for URL parser)
+ *  4. Parse with Node's URL class — extracts hostname reliably
+ *  5. Strip leading "www." prefix so www.domain.com === domain.com
+ *
+ * Handles:
+ *  ✅ https://www.satset138asia.com/         → satset138asia.com
+ *  ✅ http://satset138asia.com/              → satset138asia.com
+ *  ✅ satset138asia.com                      → satset138asia.com
+ *  ✅ www.satset138asia.com                  → satset138asia.com
+ *  ✅ https://satset138asia.com/?amp         → satset138asia.com
+ *  ✅ https://satset138asia.com/page?q=test  → satset138asia.com
+ *  ✅ https://amp.satset138asia.com/         → amp.satset138asia.com
+ *  ✅ https://blog.satset138asia.com/post/1  → blog.satset138asia.com
+ *
+ * Returns: normalized hostname string, or null if unparseable.
+ */
+function normalizeDomain(input) {
+  if (!input || typeof input !== 'string') return null;
+
+  let str = input.trim().toLowerCase();
+  if (!str) return null;
+
+  // Ensure protocol for URL parser
+  if (!str.startsWith('http://') && !str.startsWith('https://')) {
+    str = 'https://' + str;
+  }
+
+  let hostname;
+  try {
+    hostname = new URL(str).hostname;
+  } catch {
+    // URL parsing failed — try stripping to bare domain manually
+    // e.g. "satset138asia.com/page" without protocol still fails URL()
+    // so strip everything after first slash and retry
+    const stripped = str.replace(/^https?:\/\//, '').split('/')[0];
+    try {
+      hostname = new URL('https://' + stripped).hostname;
+    } catch {
+      return null;
+    }
+  }
+
+  if (!hostname) return null;
+
+  // Strip leading www. — treat www.domain.com identical to domain.com
+  if (hostname.startsWith('www.')) {
+    hostname = hostname.slice(4);
+  }
+
+  return hostname;
+}
+
+/**
+ * isGoogleInfrastructure(normalizedHostname)
+ *
+ * Returns true if the hostname belongs to Google's own infrastructure
+ * and should be skipped during SERP parsing.
+ *
+ * Uses exact suffix matching — NOT includes() — to avoid false positives
+ * like "mygoogle.com" being incorrectly excluded.
+ */
+function isGoogleInfrastructure(host) {
+  if (!host) return false;
+  for (const suffix of GOOGLE_INFRA_SUFFIXES) {
+    if (host === suffix) return true;
+    if (host.endsWith('.' + suffix)) return true;
+  }
+  return false;
+}
+
+/**
+ * findDomainRank(organicResults, targetDomain)
+ *
+ * Searches SERPAPI organic_results array for a matching domain.
+ * Returns the rank (1-indexed integer) or null if not found.
+ *
+ * Matching logic:
+ *  1. Normalize targetDomain (strip www, parse hostname)
+ *  2. For each result, normalize result.link the same way
+ *  3. Compare with THREE strategies (no includes() anywhere):
+ *     a. Exact match:    result === target
+ *        e.g. satset138asia.com === satset138asia.com  ✅
+ *     b. Result is subdomain of target:
+ *        result.endsWith('.' + target)
+ *        e.g. blog.satset138asia.com ends with .satset138asia.com  ✅
+ *     c. Target is subdomain of result:
+ *        target.endsWith('.' + result)
+ *        e.g. user added "satset138asia.com", SERP returns "m.satset138asia.com"
+ *        — treated as match since same root domain  ✅
+ *  4. Skip Google infrastructure URLs
+ *  5. Skip duplicate normalized hostnames
+ *  6. Debug-log every comparison when DEBUG_RANK=true
+ *
+ * @param {Array}  organicResults  - SERPAPI organic_results array
+ * @param {string} targetDomain    - Domain stored in DB (e.g. "satset138asia.com")
+ * @returns {number|null}          - Rank position, or null
+ */
+function findDomainRank(organicResults, targetDomain) {
+  const normalizedTarget = normalizeDomain(targetDomain);
+
+  if (!normalizedTarget) {
+    console.warn(`[RANK] ⚠️  Cannot normalize target: "${targetDomain}"`);
+    return null;
+  }
+
+  console.log(`[RANK] Target: "${targetDomain}" → normalized: "${normalizedTarget}"`);
+
+  const seenNormalized = new Set();
+  let position = 0;
+
+  for (const result of organicResults) {
+    const rawUrl = result.link || result.url || '';
+    if (!rawUrl) continue;
+
+    // Use SERPAPI's own position field if present, otherwise count manually
+    const serpPosition = typeof result.position === 'number'
+      ? result.position
+      : ++position;
+
+    const normalizedResult = normalizeDomain(rawUrl);
+
+    if (DEBUG_RANK) {
+      console.log(
+        `[RANK] #${String(serpPosition).padStart(3)} | ` +
+        `raw="${rawUrl.substring(0, 70)}" | ` +
+        `normalized="${normalizedResult}" | ` +
+        `target="${normalizedTarget}"`
+      );
+    }
+
+    // Skip unparseable URLs
+    if (!normalizedResult) {
+      if (DEBUG_RANK) console.log(`[RANK]          ↳ SKIP: unparseable URL`);
+      continue;
+    }
+
+    // Skip Google infrastructure (cache, translate, amp proxy, etc.)
+    if (isGoogleInfrastructure(normalizedResult)) {
+      if (DEBUG_RANK) console.log(`[RANK]          ↳ SKIP: Google infrastructure`);
+      continue;
+    }
+
+    // Skip duplicate normalized hostnames (dedup within SERP)
+    if (seenNormalized.has(normalizedResult)) {
+      if (DEBUG_RANK) console.log(`[RANK]          ↳ SKIP: duplicate hostname`);
+      continue;
+    }
+    seenNormalized.add(normalizedResult);
+
+    // ── MATCHING STRATEGIES ──────────────────────────────────
+
+    // Strategy A: Exact match (www stripped from both sides already)
+    // "satset138asia.com" === "satset138asia.com"
+    if (normalizedResult === normalizedTarget) {
+      console.log(`[RANK] ✅ MATCH (exact) at position #${serpPosition}: "${normalizedResult}"`);
+      return serpPosition;
+    }
+
+    // Strategy B: Result is subdomain of target
+    // "blog.satset138asia.com".endsWith(".satset138asia.com") → true
+    if (normalizedResult.endsWith('.' + normalizedTarget)) {
+      console.log(`[RANK] ✅ MATCH (result is subdomain) at #${serpPosition}: "${normalizedResult}" ⊂ "${normalizedTarget}"`);
+      return serpPosition;
+    }
+
+    // Strategy C: Target is subdomain of result
+    // target="satset138asia.com", result="satset138asia.com" → already caught by A
+    // target="sub.satset138asia.com", result="satset138asia.com" → catch here
+    if (normalizedTarget.endsWith('.' + normalizedResult)) {
+      console.log(`[RANK] ✅ MATCH (target is subdomain) at #${serpPosition}: "${normalizedTarget}" ⊂ "${normalizedResult}"`);
+      return serpPosition;
+    }
+  }
+
+  console.log(`[RANK] ❌ NOT FOUND in ${organicResults.length} results — target: "${normalizedTarget}"`);
+  return null;
+}
+
+// ============================================================
+// CLEAN DOMAIN (USER INPUT)
+// ============================================================
+
+/**
+ * cleanDomain(input)
+ *
+ * Sanitize domain submitted by user via /add command.
+ * Stores normalized form (no www, no protocol, no path) in DB.
+ * This ensures stored domain matches how findDomainRank normalizes it.
  */
 function cleanDomain(input) {
-  let d = input.trim();
-  d = d.replace(/^https?:\/\//i, '');
-  d = d.replace(/\/.*$/, '');
-  d = d.toLowerCase();
-  return d;
+  const normalized = normalizeDomain(input.trim());
+  if (!normalized) {
+    // Fallback: manual strip if URL parser fails
+    let d = input.trim().toLowerCase();
+    d = d.replace(/^https?:\/\//i, '');
+    d = d.replace(/^www\./i, '');
+    d = d.replace(/\/.*$/, '');
+    d = d.replace(/\?.*$/, '');
+    d = d.replace(/#.*$/, '');
+    return d;
+  }
+  return normalized;
 }
+
+// ============================================================
+// GENERAL UTILITY FUNCTIONS
+// ============================================================
 
 /**
  * Get keyword from Telegram message via topic ID
@@ -171,8 +393,7 @@ function getKeywordFromMsg(msg) {
  * Format current time in WIB (UTC+7)
  */
 function getWIBTime() {
-  const now = new Date();
-  return now.toLocaleString('id-ID', {
+  return new Date().toLocaleString('id-ID', {
     timeZone: 'Asia/Jakarta',
     day: '2-digit',
     month: '2-digit',
@@ -184,7 +405,7 @@ function getWIBTime() {
 }
 
 /**
- * Format TIMESTAMPTZ from DB to WIB string
+ * Format a TIMESTAMPTZ value from DB to WIB-formatted string
  */
 function formatWIBFromDate(date) {
   if (!date) return 'Belum dicek';
@@ -200,109 +421,61 @@ function formatWIBFromDate(date) {
 }
 
 /**
- * Extract clean hostname from a URL string.
- * Returns null if invalid or should be ignored.
- */
-function extractHostname(rawUrl) {
-  if (!rawUrl) return null;
-  try {
-    const urlStr = rawUrl.startsWith('http') ? rawUrl : 'https://' + rawUrl;
-    const parsed = new URL(urlStr);
-    const host = parsed.hostname.toLowerCase();
-
-    // Ignore Google infrastructure
-    if (
-      host.includes('googleusercontent.com') ||
-      host.includes('translate.google') ||
-      host.includes('webcache.googleusercontent') ||
-      host.includes('google.com') ||
-      host.includes('gstatic.com') ||
-      host.includes('googleapis.com')
-    ) {
-      return null;
-    }
-
-    return host;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Check if a SERP result URL matches a target domain.
- * Supports exact match or subdomain matching.
- */
-function urlMatchesDomain(resultUrl, targetDomain) {
-  const host = extractHostname(resultUrl);
-  if (!host) return false;
-
-  // Exact: domain.com === domain.com
-  if (host === targetDomain) return true;
-
-  // SERP result is subdomain of target: sub.domain.com ends with .domain.com
-  if (host.endsWith('.' + targetDomain)) return true;
-
-  // Target is subdomain of result (less common but handle it)
-  if (targetDomain.endsWith('.' + host)) return true;
-
-  return false;
-}
-
-/**
- * Promise-based sleep
+ * Promise-based sleep helper
  */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ============================================================
-// SERPAPI - FETCH RANKING
+// SERPAPI — FETCH GOOGLE MOBILE INDONESIA SERP
 // ============================================================
 
 /**
- * Fetch keyword rank for a target domain from Google Mobile Indonesia SERP.
- * Returns rank (integer) or null if not found.
+ * fetchSERPRank(keyword, targetDomain)
+ *
+ * Hits SERPAPI with full Google Mobile Indonesia parameters.
+ * Passes raw organic_results to findDomainRank() for accurate matching.
+ *
+ * @param {string} keyword      - Search keyword
+ * @param {string} targetDomain - Domain to find (stored form, e.g. "satset138asia.com")
+ * @returns {number|null}       - Rank position or null
  */
 async function fetchSERPRank(keyword, targetDomain) {
   const params = {
-    engine: 'google',
-    q: keyword,
-    gl: 'id',
-    hl: 'id',
-    google_domain: 'google.co.id',
-    device: 'mobile',
-    location: 'Indonesia',
-    num: 100,
-    no_cache: true,
-    api_key: SERPAPI_KEY,
+    engine:        'google',
+    q:             keyword,
+    gl:            'id',              // Geolocation: Indonesia
+    hl:            'id',              // Language: Indonesian
+    google_domain: 'google.co.id',   // Use google.co.id
+    device:        'mobile',          // Mobile SERP
+    location:      'Indonesia',       // Simulate Indonesian user
+    num:           100,               // Fetch top 100 results
+    no_cache:      true,              // Always fresh — bypass SERPAPI cache
+    api_key:       SERPAPI_KEY,
   };
+
+  console.log(`[SERP] Fetching: keyword="${keyword}" target="${targetDomain}"`);
 
   const response = await axios.get('https://serpapi.com/search.json', {
     params,
     timeout: 35000,
   });
 
-  const organicResults = response.data?.organic_results;
+  const data           = response.data;
+  const organicResults = data?.organic_results;
+
   if (!Array.isArray(organicResults) || organicResults.length === 0) {
-    console.warn(`⚠️  No organic results for keyword: ${keyword}`);
+    console.warn(`[SERP] ⚠️  No organic results returned for keyword: "${keyword}"`);
     return null;
   }
 
-  const seenUrls = new Set();
+  console.log(`[SERP] Got ${organicResults.length} organic results for "${keyword}"`);
 
-  for (const result of organicResults) {
-    const resultUrl = result.link || result.url || '';
-    if (!resultUrl || seenUrls.has(resultUrl)) continue;
-    seenUrls.add(resultUrl);
+  // Delegate matching to the fixed rank detection engine
+  const rank = findDomainRank(organicResults, targetDomain);
 
-    if (urlMatchesDomain(resultUrl, targetDomain)) {
-      // Use SERPAPI's position field if present, otherwise derive from index
-      const rank = result.position ?? (organicResults.indexOf(result) + 1);
-      return rank;
-    }
-  }
-
-  return null; // Not found in top 100
+  return rank;
 }
 
 // ============================================================
@@ -342,31 +515,36 @@ async function dbGetAllDomains() {
 }
 
 /**
- * Update domain rank in DB and return change info.
- * Returns: { domain, keyword, oldRank, newRank, oldStatus, newStatus, changeType }
+ * dbUpdateRank(keyword, domain, newRank)
+ *
+ * Reads current DB state, computes change_type, then writes updated rank.
+ *
+ * change_type logic:
+ *   NEW    — was NOT_FOUND, now FOUND
+ *   LOST   — was FOUND, now NOT_FOUND
+ *   UP     — rank number decreased (improved, e.g. #10 → #5)
+ *   DOWN   — rank number increased (worsened, e.g. #5 → #10)
+ *   STABLE — no change
+ *
+ * Returns change info object or null if domain no longer exists in DB.
  */
 async function dbUpdateRank(keyword, domain, newRank) {
   const client = await pool.connect();
   try {
-    // Fetch current state
     const res = await client.query(
       'SELECT * FROM domains WHERE keyword = $1 AND domain = $2',
       [keyword, domain]
     );
 
-    if (res.rows.length === 0) {
-      // Domain was deleted, skip
-      return null;
-    }
+    if (res.rows.length === 0) return null;
 
-    const row = res.rows[0];
-    const oldRank = row.current_rank;       // previous rank value
-    const oldStatus = row.status;           // FOUND / NOT_FOUND
-
+    const row       = res.rows[0];
+    const oldRank   = row.current_rank;   // INTEGER or null
+    const oldStatus = row.status;         // 'FOUND' | 'NOT_FOUND'
     const newStatus = newRank ? 'FOUND' : 'NOT_FOUND';
 
     let changeType;
-    if (newRank && !oldRank && oldStatus === 'NOT_FOUND') {
+    if (newRank && oldStatus === 'NOT_FOUND') {
       changeType = 'NEW';
     } else if (!newRank && oldStatus === 'FOUND') {
       changeType = 'LOST';
@@ -400,22 +578,19 @@ async function dbUpdateRank(keyword, domain, newRank) {
 // TELEGRAM SEND HELPERS
 // ============================================================
 
-/**
- * Send message to a specific forum topic
- */
 async function sendToTopic(topicId, text) {
   try {
     await bot.sendMessage(CHAT_ID, text, {
-      message_thread_id: topicId,
-      parse_mode: 'HTML',
+      message_thread_id:       topicId,
+      parse_mode:              'HTML',
       disable_web_page_preview: true,
     });
   } catch (err) {
     console.error(`❌ sendToTopic(${topicId}) failed:`, err.message);
-    // Fallback: send without topic
+    // Fallback without topic thread
     try {
       await bot.sendMessage(CHAT_ID, text, {
-        parse_mode: 'HTML',
+        parse_mode:              'HTML',
         disable_web_page_preview: true,
       });
     } catch (err2) {
@@ -424,13 +599,10 @@ async function sendToTopic(topicId, text) {
   }
 }
 
-/**
- * Reply to the message within its topic (thread)
- */
 async function replyInTopic(msg, text) {
   try {
     const opts = {
-      parse_mode: 'HTML',
+      parse_mode:              'HTML',
       disable_web_page_preview: true,
     };
     if (msg.message_thread_id) {
@@ -481,14 +653,13 @@ function buildChangeNotification(result) {
         `<b>#${oldRank} ➜ #${newRank}</b>`
       );
 
-    case 'STABLE':
     default:
-      return null; // Don't spam stable notifications
+      return null; // STABLE — no notification
   }
 }
 
 // ============================================================
-// SNAPSHOT UPDATE BUILDER
+// SNAPSHOT MESSAGE BUILDER
 // ============================================================
 
 function buildSnapshotMessage(keyword, domains) {
@@ -515,7 +686,7 @@ function buildSnapshotMessage(keyword, domains) {
 }
 
 // ============================================================
-// CORE MONITORING FUNCTION
+// CORE MONITORING CYCLE
 // ============================================================
 
 async function runMonitoringCycle() {
@@ -544,7 +715,7 @@ async function runMonitoringCycle() {
   for (const [keyword, domains] of Object.entries(grouped)) {
     const topicId = KEYWORD_TOPIC_MAP[keyword];
     if (!topicId) {
-      console.warn(`⚠️  [MONITOR] No topic ID found for keyword: ${keyword}`);
+      console.warn(`⚠️  [MONITOR] No topic ID for keyword: ${keyword}`);
       continue;
     }
 
@@ -554,9 +725,8 @@ async function runMonitoringCycle() {
 
     for (const d of domains) {
       await sleep(SERPAPI_DELAY_MS);
-
       try {
-        const rank = await fetchSERPRank(keyword, d.domain);
+        const rank   = await fetchSERPRank(keyword, d.domain);
         const result = await dbUpdateRank(keyword, d.domain, rank);
 
         if (!result) continue;
@@ -569,11 +739,11 @@ async function runMonitoringCycle() {
         }
       } catch (err) {
         console.error(`  ❌ Error checking ${d.domain}:`, err.message);
-        // Continue to next domain — don't crash the cycle
+        // Continue — don't let 1 domain crash the whole cycle
       }
     }
 
-    // Send change notifications first (only if there are changes)
+    // Send change notifications first
     for (const result of changeResults) {
       const notif = buildChangeNotification(result);
       if (notif) {
@@ -591,7 +761,7 @@ async function runMonitoringCycle() {
       console.error(`❌ [MONITOR] Failed to send snapshot for ${keyword}:`, err.message);
     }
 
-    // Delay between keywords to be polite to SERPAPI
+    // Delay between keywords
     await sleep(3000);
   }
 
@@ -632,7 +802,10 @@ bot.onText(/^\/add(@\w+)?\s+(.+)$/i, async (msg, match) => {
   const domain = cleanDomain(rawInput);
 
   if (!domain || !domain.includes('.') || domain.length < 4) {
-    await replyInTopic(msg, `⚠️ Domain tidak valid: <code>${rawInput}</code>\n\nContoh: <code>/add domain.com</code>`);
+    await replyInTopic(
+      msg,
+      `⚠️ Domain tidak valid: <code>${rawInput}</code>\n\nContoh: <code>/add domain.com</code>`
+    );
     return;
   }
 
@@ -706,7 +879,8 @@ bot.onText(/^\/list(@\w+)?$/, async (msg) => {
     if (domains.length === 0) {
       await replyInTopic(
         msg,
-        `📋 <b>LIST DOMAIN ${keyword}</b>\n\nBelum ada domain yang ditambahkan.\n\nGunakan: <code>/add domain.com</code>`
+        `📋 <b>LIST DOMAIN ${keyword}</b>\n\n` +
+        `Belum ada domain yang ditambahkan.\n\nGunakan: <code>/add domain.com</code>`
       );
       return;
     }
@@ -714,16 +888,14 @@ bot.onText(/^\/list(@\w+)?$/, async (msg) => {
     let text = `📋 <b>LIST DOMAIN ${keyword}</b>\n\n`;
 
     domains.forEach((d, i) => {
-      const n = i + 1;
-      const rankLine =
-        d.status === 'FOUND' && d.current_rank
-          ? `   🏆 Rank #${d.current_rank}`
-          : `   ❌ Tidak ditemukan`;
-
-      const checkedLine = `   🕒 ${formatWIBFromDate(d.last_checked)}`;
+      const n        = i + 1;
+      const rankLine = d.status === 'FOUND' && d.current_rank
+        ? `   🏆 Rank #${d.current_rank}`
+        : `   ❌ Tidak ditemukan`;
       const statusLine = d.status === 'FOUND'
         ? `   ✅ Status: FOUND`
         : `   ❌ Status: NOT FOUND`;
+      const checkedLine = `   🕒 ${formatWIBFromDate(d.last_checked)}`;
 
       text += `${n}. <code>${d.domain}</code>\n${rankLine}\n${statusLine}\n${checkedLine}\n\n`;
     });
@@ -756,7 +928,8 @@ bot.onText(/^\/check(@\w+)?$/, async (msg) => {
   if (domains.length === 0) {
     await replyInTopic(
       msg,
-      `⚠️ Belum ada domain yang ditambahkan untuk keyword <b>${keyword}</b>.\n\nGunakan: <code>/add domain.com</code>`
+      `⚠️ Belum ada domain untuk keyword <b>${keyword}</b>.\n\n` +
+      `Gunakan: <code>/add domain.com</code>`
     );
     return;
   }
@@ -764,17 +937,17 @@ bot.onText(/^\/check(@\w+)?$/, async (msg) => {
   await replyInTopic(
     msg,
     `🔍 <b>Mengecek ranking ${keyword}...</b>\n` +
-    `📡 Menghubungi Google Mobile Indonesia\n` +
+    `📡 Google Mobile Indonesia (google.co.id)\n` +
     `⏳ Mohon tunggu (${domains.length} domain)...`
   );
 
-  const checkResults = [];
+  const checkResults  = [];
   const changeResults = [];
 
   for (const d of domains) {
     await sleep(SERPAPI_DELAY_MS);
     try {
-      const rank = await fetchSERPRank(keyword, d.domain);
+      const rank   = await fetchSERPRank(keyword, d.domain);
       const result = await dbUpdateRank(keyword, d.domain, rank);
       checkResults.push({ domain: d.domain, rank });
 
@@ -782,8 +955,7 @@ bot.onText(/^\/check(@\w+)?$/, async (msg) => {
         changeResults.push(result);
       }
 
-      const rankStr = rank ? `#${rank}` : 'NOT FOUND';
-      console.log(`  /check: ${d.domain} → ${rankStr}`);
+      console.log(`  /check: ${d.domain} → ${rank ? '#' + rank : 'NOT FOUND'}`);
     } catch (err) {
       console.error(`  ❌ /check error for ${d.domain}:`, err.message);
       checkResults.push({ domain: d.domain, rank: null, error: true });
@@ -799,7 +971,7 @@ bot.onText(/^\/check(@\w+)?$/, async (msg) => {
     }
   }
 
-  // Build result message
+  // Build and send result message
   const timeStr = getWIBTime();
   let text =
     `🏆 <b>STATUS KEYWORD ${keyword}</b>\n` +
@@ -825,11 +997,27 @@ bot.onText(/^\/check(@\w+)?$/, async (msg) => {
   await replyInTopic(msg, text);
 });
 
-// ── Catch unhandled commands gracefully ───────────────────────
+// ── /debug <domain> — prints normalization result ─────────────
+bot.onText(/^\/debug(@\w+)?\s+(.+)$/i, async (msg, match) => {
+  const rawInput = match[2]?.trim();
+  if (!rawInput) {
+    await replyInTopic(msg, '⚠️ Format: <code>/debug https://www.domain.com/page</code>');
+    return;
+  }
+  const normalized = normalizeDomain(rawInput);
+  await replyInTopic(
+    msg,
+    `🔧 <b>DEBUG NORMALIZATION</b>\n\n` +
+    `Input: <code>${rawInput}</code>\n` +
+    `Output: <code>${normalized ?? 'null (parse failed)'}</code>`
+  );
+});
+
+// ── Catch unknown commands gracefully ─────────────────────────
 bot.on('message', (msg) => {
   if (msg.text && msg.text.startsWith('/')) {
     const command = msg.text.split(' ')[0].replace(/@\w+/, '').toLowerCase();
-    const known = ['/ping', '/add', '/remove', '/list', '/check'];
+    const known   = ['/ping', '/add', '/remove', '/list', '/check', '/debug'];
     if (!known.includes(command)) {
       replyInTopic(
         msg,
@@ -837,9 +1025,10 @@ bot.on('message', (msg) => {
         '<b>Commands yang tersedia:</b>\n' +
         '• <code>/add domain.com</code> — Tambah domain\n' +
         '• <code>/remove domain.com</code> — Hapus domain\n' +
-        '• <code>/list</code> — Lihat semua domain\n' +
-        '• <code>/check</code> — Cek ranking sekarang\n' +
-        '• <code>/ping</code> — Cek status bot'
+        '• <code>/list</code> — Lihat semua domain + rank\n' +
+        '• <code>/check</code> — Force check ranking sekarang\n' +
+        '• <code>/ping</code> — Cek status bot\n' +
+        '• <code>/debug url</code> — Debug normalisasi URL'
       ).catch(() => {});
     }
   }
@@ -864,43 +1053,41 @@ cron.schedule('*/30 * * * *', async () => {
 
 async function start() {
   console.log('\n======================================================');
-  console.log('  🤖 Telegram SEO Rank Monitor Bot');
+  console.log('  🤖 Telegram SEO Rank Monitor Bot  v1.1.0');
   console.log('  📍 Google Mobile Indonesia SERP');
+  console.log('  🔧 Fixed: normalizeDomain + findDomainRank');
   console.log('======================================================\n');
 
   try {
-    // Test DB connection
     await pool.query('SELECT 1');
     console.log('✅ PostgreSQL connected');
 
-    // Init tables
     await initDB();
 
-    // Start Express
     app.listen(PORT, () => {
       console.log(`✅ Express running on port ${PORT}`);
     });
 
-    console.log('✅ Telegram bot polling started');
-    console.log('✅ Cron scheduler active (every 30 minutes)\n');
-
-    // Verify bot identity
     const me = await bot.getMe();
-    console.log(`🤖 Bot: @${me.username} (${me.first_name})\n`);
+    console.log(`✅ Telegram bot: @${me.username} (${me.first_name})`);
+    console.log('✅ Cron scheduler active (every 30 minutes)');
 
-    console.log('Topic → Keyword mapping:');
+    console.log('\nTopic → Keyword mapping:');
     for (const [id, kw] of Object.entries(TOPIC_KEYWORD_MAP)) {
       console.log(`  Topic ${id} → ${kw}`);
     }
 
-    console.log('\n📌 Available commands:');
-    console.log('  /add domain.com — Add a domain');
-    console.log('  /remove domain.com — Remove a domain');
-    console.log('  /list — List all domains');
-    console.log('  /check — Force check now');
-    console.log('  /ping — Check bot status\n');
+    console.log(`\nDebug mode: ${DEBUG_RANK ? 'ON (verbose SERP logging)' : 'OFF (set DEBUG_RANK=true to enable)'}`);
 
-    // Run initial monitoring after 15s startup delay
+    console.log('\n📌 Available commands:');
+    console.log('  /add domain.com    — Add domain');
+    console.log('  /remove domain.com — Remove domain');
+    console.log('  /list              — List domains + ranks');
+    console.log('  /check             — Force check now');
+    console.log('  /ping              — Bot status');
+    console.log('  /debug <url>       — Test URL normalization\n');
+
+    // Run initial monitoring 15s after startup
     setTimeout(async () => {
       console.log('🔄 Running initial monitoring cycle...');
       try {
@@ -921,23 +1108,22 @@ async function start() {
 // ============================================================
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ [uncaughtException]', err.message, err.stack);
-  // Don't exit — keep running
+  console.error('❌ [uncaughtException]', err.message);
+  console.error(err.stack);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('❌ [unhandledRejection]', reason);
-  // Don't exit — keep running
 });
 
 process.on('SIGTERM', async () => {
-  console.log('🛑 SIGTERM received — shutting down gracefully...');
+  console.log('🛑 SIGTERM — shutting down gracefully...');
   await pool.end();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  console.log('\n🛑 SIGINT received — shutting down...');
+  console.log('\n🛑 SIGINT — shutting down...');
   await pool.end();
   process.exit(0);
 });
