@@ -9,7 +9,7 @@ const bot = new TelegramBot(token, {
 });
 
 // =======================
-// GROUP TELEGRAM
+// GROUP ID TELEGRAM
 // =======================
 
 const GROUP_ID = -1003954107367;
@@ -35,16 +35,91 @@ let domains = {
 };
 
 // =======================
-// STATUS SEBELUMNYA
+// STATUS DOMAIN
 // =======================
 
 let previousStatus = {};
 
+let disappearCount = {};
+
 // =======================
-// HITUNG HILANG
+// CEK RANK GOOGLE
+// MOBILE INDONESIA
 // =======================
 
-let disappearCount = {};
+async function checkRank(keyword, domain) {
+
+  try {
+
+    const query = encodeURIComponent(keyword);
+
+    const url =
+      `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100&pws=0`;
+
+    const response = await axios.get(url, {
+
+      headers: {
+
+        "User-Agent":
+          "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile Safari/604.1",
+
+        "Accept-Language":
+          "id-ID,id;q=0.9",
+
+        "Cache-Control":
+          "no-cache"
+
+      },
+
+      timeout: 15000
+
+    });
+
+    const html = response.data;
+
+    const matches = [
+      ...html.matchAll(/<a href="\/url\?q=(.*?)&amp;/g)
+    ];
+
+    let rank = 1;
+
+    for (const match of matches) {
+
+      const resultUrl =
+        decodeURIComponent(match[1]);
+
+      if (
+        resultUrl.includes(domain)
+      ) {
+
+        return {
+          found: true,
+          rank: rank
+        };
+
+      }
+
+      rank++;
+
+    }
+
+    return {
+      found: false,
+      rank: null
+    };
+
+  } catch (err) {
+
+    console.log(err.message);
+
+    return {
+      found: false,
+      rank: null
+    };
+
+  }
+
+}
 
 // =======================
 // TAMBAH DOMAIN
@@ -69,7 +144,9 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     return;
   }
 
-  if (!domains[keyword].includes(domain)) {
+  if (
+    !domains[keyword].includes(domain)
+  ) {
 
     domains[keyword].push(domain);
 
@@ -82,7 +159,8 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
 Keyword: ${keyword}
 Domain: ${domain}`,
     {
-      message_thread_id: TOPICS[keyword]
+      message_thread_id:
+        TOPICS[keyword]
     }
   );
 
@@ -103,9 +181,10 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
 
   if (!domains[keyword]) return;
 
-  domains[keyword] = domains[keyword].filter(
-    d => d !== domain
-  );
+  domains[keyword] =
+    domains[keyword].filter(
+      d => d !== domain
+    );
 
   bot.sendMessage(
     GROUP_ID,
@@ -114,73 +193,99 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
 Keyword: ${keyword}
 Domain: ${domain}`,
     {
-      message_thread_id: TOPICS[keyword]
+      message_thread_id:
+        TOPICS[keyword]
     }
   );
 
 });
 
 // =======================
-// CEK RANK GOOGLE
-// MOBILE + INDONESIA
+// CHECK MANUAL
 // =======================
 
-async function checkRank(keyword, domain) {
+bot.onText(/\/check/, async (msg) => {
 
-  try {
+  const topicId =
+    msg.message_thread_id;
 
-    const query = encodeURIComponent(keyword);
+  let selectedKeyword = null;
 
-    const url =
-      `https://www.google.com/search?q=${query}&gl=id&hl=id&num=100&pws=0`;
+  for (const keyword in TOPICS) {
 
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 Chrome/122.0.0.0 Mobile Safari/537.36'
-      }
-    });
+    if (
+      TOPICS[keyword] === topicId
+    ) {
 
-    const html = response.data;
-
-    const regex = /<a href="\/url\?q=(.*?)&/g;
-
-    let match;
-
-    let rank = 0;
-
-    while ((match = regex.exec(html)) !== null) {
-
-      const resultUrl = decodeURIComponent(match[1]);
-
-      if (resultUrl.includes(domain)) {
-
-        return {
-          found: true,
-          rank: rank + 1
-        };
-
-      }
-
-      rank++;
+      selectedKeyword = keyword;
 
     }
 
-    return {
-      found: false,
-      rank: null
-    };
+  }
 
-  } catch (e) {
+  if (!selectedKeyword) {
 
-    return {
-      found: false,
-      rank: null
-    };
+    bot.sendMessage(
+      msg.chat.id,
+      '❌ Gunakan command di dalam topic.'
+    );
+
+    return;
 
   }
 
-}
+  let report =
+`📊 STATUS KEYWORD ${selectedKeyword}
+
+`;
+
+  for (
+    const domain of
+    domains[selectedKeyword]
+  ) {
+
+    report +=
+`🔎 Checking ${domain}...
+
+`;
+
+    const result =
+      await checkRank(
+        selectedKeyword,
+        domain
+      );
+
+    if (result.found) {
+
+      report +=
+`✅ DOMAIN TERDETEKSI
+🌍 ${domain}
+📌 Rank Mobile Indonesia: ${result.rank}
+
+`;
+
+    } else {
+
+      report +=
+`❌ DOMAIN TIDAK MASUK 100 BESAR
+🌍 ${domain}
+
+`;
+
+    }
+
+  }
+
+  bot.sendMessage(
+    GROUP_ID,
+    report,
+    {
+      message_thread_id:
+        topicId
+    }
+  );
+
+});
 
 // =======================
 // MONITOR AUTO
@@ -190,18 +295,24 @@ async function monitor() {
 
   for (const keyword in domains) {
 
-    for (const domain of domains[keyword]) {
+    for (
+      const domain of domains[keyword]
+    ) {
 
-      const result = await checkRank(
-        keyword,
-        domain
-      );
+      const result =
+        await checkRank(
+          keyword,
+          domain
+        );
 
-      const found = result.found;
+      const found =
+        result.found;
 
-      const rank = result.rank;
+      const rank =
+        result.rank;
 
-      const key = `${keyword}_${domain}`;
+      const key =
+        `${keyword}_${domain}`;
 
       // =======================
       // DOMAIN MUNCUL
@@ -222,9 +333,10 @@ async function monitor() {
 
 Keyword: ${keyword}
 Domain: ${domain}
-Rank Mobile ID: ${rank}`,
+📌 Rank Mobile Indonesia: ${rank}`,
           {
-            message_thread_id: TOPICS[keyword]
+            message_thread_id:
+              TOPICS[keyword]
           }
         );
 
@@ -250,19 +362,23 @@ Rank Mobile ID: ${rank}`,
 
 Keyword: ${keyword}
 Domain: ${domain}
-Jumlah Hilang: ${disappearCount[key]}/2`,
+❌ Hilang Ke: ${disappearCount[key]}/2`,
           {
-            message_thread_id: TOPICS[keyword]
+            message_thread_id:
+              TOPICS[keyword]
           }
         );
 
-        // AUTO HAPUS JIKA HILANG 2X
+        // AUTO DELETE
 
-        if (disappearCount[key] >= 2) {
+        if (
+          disappearCount[key] >= 2
+        ) {
 
-          domains[key] = domains[key].filter(
-            d => d !== domain
-          );
+          domains[keyword] =
+            domains[keyword].filter(
+              d => d !== domain
+            );
 
           bot.sendMessage(
             GROUP_ID,
@@ -271,7 +387,8 @@ Jumlah Hilang: ${disappearCount[key]}/2`,
 Keyword: ${keyword}
 Domain: ${domain}`,
             {
-              message_thread_id: TOPICS[keyword]
+              message_thread_id:
+                TOPICS[keyword]
             }
           );
 
@@ -286,89 +403,31 @@ Domain: ${domain}`,
 }
 
 // =======================
-// CEK SETIAP 30 MENIT
+// AUTO CHECK 30 MENIT
 // =======================
 
-cron.schedule('*/30 * * * *', async () => {
+cron.schedule(
+  '*/30 * * * *',
+  async () => {
 
-  await monitor();
-
-});
-
-// =======================
-// CHECK MANUAL
-// SESUAI TOPIC
-// =======================
-
-bot.onText(/\/check/, async (msg) => {
-
-  const topicId = msg.message_thread_id;
-
-  let selectedKeyword = null;
-
-  for (const keyword in TOPICS) {
-
-    if (TOPICS[keyword] === topicId) {
-
-      selectedKeyword = keyword;
-
-    }
-
-  }
-
-  if (!selectedKeyword) {
-
-    bot.sendMessage(
-      msg.chat.id,
-      '❌ Gunakan command di dalam topic.'
+    console.log(
+      'AUTO CHECK RUNNING...'
     );
 
-    return;
-  }
-
-  bot.sendMessage(
-    GROUP_ID,
-    `📊 STATUS KEYWORD ${selectedKeyword}
-
-🔎 Checking ranking ${selectedKeyword}...`,
-    {
-      message_thread_id: topicId
-    }
-  );
-
-  let report = `📊 STATUS KEYWORD ${selectedKeyword}\n\n`;
-
-  for (const domain of domains[selectedKeyword]) {
-
-    const result = await checkRank(
-      selectedKeyword,
-      domain
-    );
-
-    report += `${result.found ? '✅' : '❌'} ${domain}\n`;
-
-    report += `📌 Rank Mobile ID: ${result.rank || 'NOT FOUND'}\n\n`;
+    await monitor();
 
   }
-
-  bot.sendMessage(
-    GROUP_ID,
-    report,
-    {
-      message_thread_id: topicId
-    }
-  );
-
-});
+);
 
 // =======================
-// BOT ONLINE
+// BOT AKTIF
 // =======================
 
 bot.sendMessage(
   GROUP_ID,
   '🤖 BOT SEO RANK MONITOR AKTIF',
   {
-    message_thread_id: TOPICS.SATSET138
+    message_thread_id:
+      TOPICS.SATSET138
   }
 );
